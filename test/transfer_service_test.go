@@ -10,7 +10,9 @@ import (
 	"github.com/gerry1818/wallet-transfer-assignment/internal/service"
 )
 
-// ✅ Mock Transaction
+// =======================
+// MOCK TX
+// =======================
 type MockTx struct {
 	fromBalance int64
 	toBalance   int64
@@ -45,6 +47,10 @@ func (m *MockTx) UpdateWallet(ctx context.Context, id int64, balance int64) erro
 	return nil
 }
 
+func (m *MockTx) GetBalance(ctx context.Context, walletID int64) (int64, error) {
+	return m.GetWalletForUpdate(ctx, walletID)
+}
+
 func (m *MockTx) CreateTransfer(ctx context.Context, from, to, amount int64, key string) (int64, error) {
 	return 1, nil
 }
@@ -57,10 +63,14 @@ func (m *MockTx) InsertLedgerEntry(ctx context.Context, walletID, transferID int
 	return nil
 }
 
-// ✅ Mock Repository
+// =======================
+// MOCK REPO
+// =======================
 type MockRepo struct {
-	inserted bool
-	tx       *MockTx
+	tx *MockTx
+
+	// idempotency simulation
+	claimOK bool
 }
 
 func (m *MockRepo) BeginTx(ctx context.Context) (repository.Tx, error) {
@@ -73,33 +83,28 @@ func (m *MockRepo) BeginTx(ctx context.Context) (repository.Tx, error) {
 	return m.tx, nil
 }
 
-func (m *MockRepo) InsertIdempotency(ctx context.Context, key string, hash string) (bool, error) {
-	return m.inserted, nil
+func (m *MockRepo) ClaimIdempotency(ctx context.Context, key, hash string) (bool, error) {
+	return m.claimOK, nil
 }
 
 func (m *MockRepo) GetIdempotency(ctx context.Context, key string) (string, int, error) {
 	return `{"transferId":1,"status":"PROCESSED"}`, 200, nil
 }
 
-func (m *MockRepo) SaveIdempotency(ctx context.Context, key, resp string, status int) error {
+func (m *MockRepo) UpdateIdempotency(ctx context.Context, key, status, resp string, code int) error {
 	return nil
 }
 
-func (m *MockTx) GetBalance(ctx context.Context, walletID int64) (int64, error) {
-	if walletID == 1 {
-		return m.fromBalance, nil
-	}
-	return m.toBalance, nil
-}
-
 //
-// ✅ Tests
+// =======================
+// TESTS
+// =======================
 //
 
 func TestIdempotencyHit(t *testing.T) {
 	logger.Init()
 
-	repo := &MockRepo{inserted: false}
+	repo := &MockRepo{claimOK: false}
 	svc := service.NewTransferService(repo)
 
 	req := model.TransferRequest{
@@ -120,14 +125,14 @@ func TestIdempotencyHit(t *testing.T) {
 	}
 
 	if resp.TransferID != 1 {
-		t.Errorf("expected 1 got %d", resp.TransferID)
+		t.Errorf("expected transferID 1 got %d", resp.TransferID)
 	}
 }
 
 func TestTransferSuccess(t *testing.T) {
 	logger.Init()
 
-	repo := &MockRepo{inserted: true}
+	repo := &MockRepo{claimOK: true}
 	svc := service.NewTransferService(repo)
 
 	req := model.TransferRequest{
@@ -151,7 +156,6 @@ func TestTransferSuccess(t *testing.T) {
 		t.Errorf("expected transferID 1 got %d", resp.TransferID)
 	}
 
-	// ✅ check balances from Tx (not repo)
 	if repo.tx.fromBalance != 900 {
 		t.Errorf("expected from balance 900 got %d", repo.tx.fromBalance)
 	}
@@ -161,7 +165,11 @@ func TestTransferSuccess(t *testing.T) {
 	}
 
 	if !repo.tx.committed {
-		t.Errorf("expected transaction commit")
+		t.Errorf("expected commit")
+	}
+
+	if repo.tx.rolledBack {
+		t.Errorf("did not expect rollback")
 	}
 }
 
@@ -169,7 +177,7 @@ func TestTransferInsufficientBalance(t *testing.T) {
 	logger.Init()
 
 	repo := &MockRepo{
-		inserted: true,
+		claimOK: true,
 		tx: &MockTx{
 			fromBalance: 50,
 			toBalance:   500,
@@ -197,5 +205,9 @@ func TestTransferInsufficientBalance(t *testing.T) {
 
 	if !repo.tx.rolledBack {
 		t.Errorf("expected rollback")
+	}
+
+	if repo.tx.committed {
+		t.Errorf("did not expect commit")
 	}
 }

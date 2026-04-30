@@ -21,10 +21,11 @@ docker run --name wallet-db \
   -d postgres
 
 # Create schema
-docker exec -i wallet-db psql -U postgres -d wallet < migrations/schema.sql
+psql -h localhost -U postgres -d wallet -f migrations/schema.sql
 
 # insert sample data into wallet
-docker exec -i wallet-db psql -U postgres -d wallet < migrations/seed.sql
+psql -h localhost -U postgres -d wallet -f migrations/seed.sql
+
 
 
 # Run service
@@ -111,13 +112,32 @@ wallet-transfer-service/
 
 ### 🔁 Idempotency Behavior
 
-* Each request must include a unique `idempotencyKey`
-* Duplicate requests:
+Each request is protected using:
 
-  * Return cached response
-  * Do NOT re-execute transaction
+`idempotencyKey + request hash`
 
-If request is still processing:
+---
+
+## 🔁 Behavior
+
+### 1. First request
+- Stored in DB
+- Transfer executes
+
+---
+
+### 2. Duplicate request (same key + same payload)
+- Returns cached response
+- No re-execution
+
+---
+
+### 3. Duplicate request (same key + different payload)
+- ❌ Rejected (400/409)
+
+---
+
+### 4. In-progress request
 
 ```json
 {
@@ -133,18 +153,19 @@ All transfers execute inside a **single DB transaction**:
 
 1. Lock wallets (`SELECT ... FOR UPDATE`)
 2. Validate balance
-3. Update wallet balances
-4. Insert ledger entries (DEBIT + CREDIT)
-5. Create transfer record
-6. Commit transaction
+3. Create transfer record
+4. Update wallet balances
+5. Insert ledger entries (DEBIT + CREDIT)
+6. Update transfer state
+7. Commit transaction
 
 ---
 
 # ⚡ Concurrency Safety
 
-* Uses row-level locking
+* Row-level locking prevents race conditions
 * Prevents double spending
-* Ensures serialized updates per wallet
+* Ensures consistency under concurrent requests
 
 ---
 
@@ -168,9 +189,17 @@ GET /metrics
 
 Tracks:
 
-* success count
-* failure count
-* idempotency hits
+* transfer_success_total
+* transfer_failure_total
+
+---
+
+⚠️ HTTP Status Codes
+
+- 200 → Success
+- 400 → Validation / business rule failure
+- 409 → Request in progress / idempotency conflict
+- 500 → Internal server error
 
 ---
 
@@ -192,10 +221,11 @@ Covers:
 
 # 🧠 Design Decisions
 
-* Strong consistency using DB transactions
-* Pessimistic locking for correctness
+* Strong consistency using PostgreSQL transactions
+* Pessimistic locking (SELECT FOR UPDATE)
 * Double-entry ledger system
 * Interface-based repository for testability
+* Request hash-based idempotency
 
 ---
 
@@ -250,3 +280,4 @@ This project used AI for:
 * system design brainstorming
 * concurrency strategy validation
 * code structuring assistance
+* test improvements

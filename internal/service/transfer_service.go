@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/gerry1818/wallet-transfer-assignment/internal/logger"
 	"github.com/gerry1818/wallet-transfer-assignment/internal/metrics"
@@ -29,106 +28,202 @@ func hash(req model.TransferRequest) string {
 	return fmt.Sprintf("%x", h)
 }
 
-func (s *TransferService) Transfer(ctx context.Context, req model.TransferRequest) (*model.TransferResponse, int, error) {
+func (s *TransferService) Transfer(
+	ctx context.Context,
+	req model.TransferRequest,
+) (*model.TransferResponse, int, error) {
 
-	logger.Log.Info("transfer start", zap.String("key", req.IdempotencyKey))
+	logger.Log.Info("transfer start",
+		zap.String("key", req.IdempotencyKey),
+	)
 
-	ok, err := s.repo.InsertIdempotency(ctx, req.IdempotencyKey, hash(req))
+	var (
+		resp      *model.TransferResponse
+		httpCode  int
+		err       error
+		status    string
+		respBytes []byte
+		tx        repository.Tx
+	)
+
+	// -----------------------------
+	// 1. Idempotency Claim
+	// -----------------------------
+	ok, err := s.repo.ClaimIdempotency(ctx, req.IdempotencyKey, hash(req))
 	if err != nil {
 		metrics.Failure.Inc()
 		return nil, 500, err
 	}
 
-	// idempotency retry
+	// already processed request
 	if !ok {
-		for i := 0; i < 3; i++ {
-			resp, code, _ := s.repo.GetIdempotency(ctx, req.IdempotencyKey)
-			if resp != "" {
-				var parsed model.TransferResponse
-				_ = json.Unmarshal([]byte(resp), &parsed)
-				return &parsed, code, nil
-			}
-			time.Sleep(50 * time.Millisecond)
+		resp, code, err := s.repo.GetIdempotency(ctx, req.IdempotencyKey)
+		if err != nil {
+			return nil, 500, err
 		}
+
+		if resp != "" {
+			var parsed model.TransferResponse
+			_ = json.Unmarshal([]byte(resp), &parsed)
+			return &parsed, code, nil
+		}
+
 		return nil, 409, fmt.Errorf("request in progress")
 	}
 
-	tx, err := s.repo.BeginTx(ctx)
+	// -----------------------------
+	// 2. Defer idempotency update
+	// -----------------------------
+	defer func() {
+		if err != nil {
+			status = "FAILED"
+
+			if respBytes == nil {
+				respBytes = []byte(fmt.Sprintf(`{"error":"%s"}`, err.Error()))
+			}
+
+			if tx != nil {
+				_ = tx.Rollback(ctx)
+			}
+		} else {
+			status = "COMPLETED"
+		}
+
+		_ = s.repo.UpdateIdempotency(
+			ctx,
+			req.IdempotencyKey,
+			status,
+			string(respBytes),
+			httpCode,
+		)
+	}()
+
+	// -----------------------------
+	// 3. Input validation
+	// -----------------------------
+	if req.Amount <= 0 {
+		metrics.Failure.Inc()
+		err = fmt.Errorf("amount must be greater than 0")
+		httpCode = 400
+		return nil, httpCode, err
+	}
+
+	if req.FromWalletID == req.ToWalletID {
+		metrics.Failure.Inc()
+		err = fmt.Errorf("from and to wallet cannot be same")
+		httpCode = 400
+		return nil, httpCode, err
+	}
+
+	// -----------------------------
+	// 4. Begin transaction
+	// -----------------------------
+	tx, err = s.repo.BeginTx(ctx)
+	if err != nil {
+		httpCode = 500
+		return nil, httpCode, err
+	}
+
+	// -----------------------------
+	// 5. Lock wallets
+	// -----------------------------
+	// ✅ lock both wallets in deterministic order to avoid deadlock
+	firstWalletID := req.FromWalletID
+	secondWalletID := req.ToWalletID
+	if firstWalletID > secondWalletID {
+		firstWalletID, secondWalletID = secondWalletID, firstWalletID
+	}
+	firstBal, err := tx.GetWalletForUpdate(ctx, firstWalletID)
 	if err != nil {
 		return nil, 500, err
 	}
-	defer tx.Rollback(ctx)
-
-	// ✅ lock both wallets (always same order to avoid deadlock)
-	fromBal, err := tx.GetWalletForUpdate(ctx, req.FromWalletID)
+	secondBal, err := tx.GetWalletForUpdate(ctx, secondWalletID)
 	if err != nil {
 		return nil, 500, err
 	}
-
-	toBal, err := tx.GetWalletForUpdate(ctx, req.ToWalletID)
-	if err != nil {
-		return nil, 500, err
+	var fromBal, toBal int64
+	if req.FromWalletID == firstWalletID {
+		fromBal = firstBal
+		toBal = secondBal
+	} else {
+		fromBal = secondBal
+		toBal = firstBal
 	}
 
-	// ✅ validate
+	// -----------------------------
+	// 6. Balance check
+	// -----------------------------
 	if fromBal < req.Amount {
 		metrics.Failure.Inc()
-		logger.Log.Error("transfer failed: insufficient balance",
-			zap.String("idempotency_key", req.IdempotencyKey),
-			zap.Int64("from_wallet_id", req.FromWalletID),
-			zap.Int64("requested_amount", req.Amount),
-			zap.Int64("available_balance", fromBal),
-		)
-		return nil, 400, fmt.Errorf("insufficient balance")
+		err = fmt.Errorf("insufficient balance")
+		httpCode = 400
+		return nil, httpCode, err
 	}
 
-	// ✅ create transfer
-	tid, err := tx.CreateTransfer(ctx,
+	// -----------------------------
+	// 7. Create transfer
+	// -----------------------------
+	tid, err := tx.CreateTransfer(
+		ctx,
 		req.FromWalletID,
 		req.ToWalletID,
 		req.Amount,
 		req.IdempotencyKey,
 	)
 	if err != nil {
-		return nil, 500, err
+		httpCode = 500
+		return nil, httpCode, err
 	}
 
-	// ✅ correct balance updates
-	err = tx.UpdateWallet(ctx, req.FromWalletID, fromBal-req.Amount)
-	if err != nil {
-		return nil, 500, err
+	// -----------------------------
+	// 8. Update balances
+	// -----------------------------
+	if err = tx.UpdateWallet(ctx, req.FromWalletID, fromBal-req.Amount); err != nil {
+		httpCode = 500
+		return nil, httpCode, err
 	}
 
-	err = tx.UpdateWallet(ctx, req.ToWalletID, toBal+req.Amount)
-	if err != nil {
-		return nil, 500, err
+	if err = tx.UpdateWallet(ctx, req.ToWalletID, toBal+req.Amount); err != nil {
+		httpCode = 500
+		return nil, httpCode, err
 	}
 
-	// ✅ ledger
+	// -----------------------------
+	// 9. Ledger entries
+	// -----------------------------
 	_ = tx.InsertLedgerEntry(ctx, req.FromWalletID, tid, "DEBIT", req.Amount)
 	_ = tx.InsertLedgerEntry(ctx, req.ToWalletID, tid, "CREDIT", req.Amount)
 
-	// ✅ update state
+	// -----------------------------
+	// 10. Update transfer state
+	// -----------------------------
 	_ = tx.UpdateTransferState(ctx, tid, "PROCESSED")
 
-	// ✅ commit
-	if err := tx.Commit(ctx); err != nil {
-		return nil, 500, err
+	// -----------------------------
+	// 11. Commit
+	// -----------------------------
+	if err = tx.Commit(ctx); err != nil {
+		httpCode = 500
+		return nil, httpCode, err
 	}
 
-	resp := model.TransferResponse{
+	// -----------------------------
+	// 12. Response
+	// -----------------------------
+	resp = &model.TransferResponse{
 		TransferID: tid,
 		Status:     "PROCESSED",
 	}
 
-	b, _ := json.Marshal(resp)
+	respBytes, _ = json.Marshal(resp)
 
-	// ✅ store idempotency OUTSIDE tx
-	_ = s.repo.SaveIdempotency(ctx, req.IdempotencyKey, string(b), 200)
+	httpCode = 200
 
 	metrics.Success.Inc()
 
-	logger.Log.Info("transfer success", zap.Int64("transfer_id", tid))
+	logger.Log.Info("transfer success",
+		zap.Int64("transfer_id", tid),
+	)
 
-	return &resp, 200, nil
+	return resp, httpCode, nil
 }

@@ -3,9 +3,9 @@ package repository
 import "context"
 
 type Repository interface {
-	InsertIdempotency(ctx context.Context, key, hash string) (bool, error)
+	ClaimIdempotency(ctx context.Context, key, hash string) (bool, error)
 	GetIdempotency(ctx context.Context, key string) (string, int, error)
-	SaveIdempotency(ctx context.Context, key, response string, status int) error // ✅ ADD THIS
+	UpdateIdempotency(ctx context.Context, key, status, response string, code int) error
 	BeginTx(ctx context.Context) (Tx, error)
 }
 
