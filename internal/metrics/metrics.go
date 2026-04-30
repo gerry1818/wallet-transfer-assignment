@@ -11,8 +11,12 @@ var (
 		Name: "transfer_failure_total",
 		Help: "Total number of failed transfer operations.",
 	})
+	IdempotencyHits = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "transfer_idempotency_hits_total",
+		Help: "Total number of idempotency cache hits.",
+	})
 )
 
 func Init() {
-	prometheus.MustRegister(Success, Failure)
+	prometheus.MustRegister(Success, Failure, IdempotencyHits)
 }

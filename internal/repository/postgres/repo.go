@@ -2,78 +2,88 @@ package postgres
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"strings"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
+	"github.com/gerry1818/wallet-transfer-assignment/internal/model"
 	"github.com/gerry1818/wallet-transfer-assignment/internal/repository"
+	"github.com/jackc/pgx/v5/pgconn"
+	"gorm.io/gorm"
 )
 
 type Repo struct {
-	pool *pgxpool.Pool
+	db *gorm.DB
 }
 
-func NewRepo(p *pgxpool.Pool) *Repo {
-	return &Repo{pool: p}
+func NewRepo(db *gorm.DB) *Repo {
+	return &Repo{db: db}
 }
 
 func (r *Repo) ClaimIdempotency(ctx context.Context, key, hash string) (bool, error) {
+	// Try to create a new idempotency record
+	result := r.db.WithContext(ctx).Create(&model.IdempotencyRecord{
+		IdempotencyKey:  key,
+		RequestHash:     hash,
+		Status:          "IN_PROGRESS",
+		StatusCode:      0,
+		ResponsePayload: "",
+	})
 
-	cmd, err := r.pool.Exec(ctx,
-		`INSERT INTO idempotency_records (idempotency_key, request_hash, status_code, status)
-		 VALUES ($1,$2,0,'IN_PROGRESS')
-		 ON CONFLICT (idempotency_key) DO NOTHING`,
-		key, hash,
-	)
-
-	if err != nil {
-		return false, err
-	}
-
-	// FIRST TIME INSERT → proceed
-	if cmd.RowsAffected() == 1 {
+	// First time insert → proceed
+	if result.Error == nil && result.RowsAffected == 1 {
 		return true, nil
 	}
 
-	// ALREADY EXISTS → validate
-	var storedHash string
-	var status string
+	// If unique constraint error, validate existing record
+	if result.Error != nil {
+		// Check if it's a duplicate key error (SQLite / GORM / PostgreSQL)
+		var pgErr *pgconn.PgError
+		isPGUniqueViolation := errors.As(result.Error, &pgErr) && pgErr.Code == "23505"
+		isSQLiteUniqueViolation := strings.Contains(result.Error.Error(), "UNIQUE constraint failed")
+		if isPGUniqueViolation || isSQLiteUniqueViolation || result.Error == gorm.ErrDuplicatedKey {
+			// Record already exists, validate it
+			var existing model.IdempotencyRecord
+			err := r.db.WithContext(ctx).
+				Where("idempotency_key = ?", key).
+				First(&existing).Error
 
-	err = r.pool.QueryRow(ctx,
-		`SELECT request_hash, status
-		 FROM idempotency_records
-		 WHERE idempotency_key=$1`,
-		key,
-	).Scan(&storedHash, &status)
+			if err != nil {
+				return false, err
+			}
 
-	if err != nil {
-		return false, err
+			// Same request → allow reuse
+			if existing.RequestHash == hash {
+				return false, nil
+			}
+
+			// Different request hash for same key -> explicit hash mismatch
+			return false, repository.ErrIdempotencyHashMismatch
+		}
+		// Other error
+		return false, result.Error
 	}
 
-	// CASE 1: same request → allow reuse
-	if storedHash == hash {
-		return false, nil
-	}
-
-	// CASE 2: different request → reject
-	return false, fmt.Errorf("idempotency key reused with different request")
+	return false, nil
 }
 
 func (r *Repo) GetIdempotency(ctx context.Context, key string) (string, int, error) {
-	var resp string
-	var code int
+	var record model.IdempotencyRecord
 
-	err := r.pool.QueryRow(ctx,
-		`SELECT response_payload, status_code FROM idempotency_records WHERE idempotency_key=$1`,
-		key).Scan(&resp, &code)
+	err := r.db.WithContext(ctx).
+		Where("idempotency_key = ?", key).
+		First(&record).Error
 
-	return resp, code, err
+	if err != nil {
+		return "", 0, err
+	}
+
+	return record.ResponsePayload, record.StatusCode, nil
 }
 
 func (r *Repo) BeginTx(ctx context.Context) (repository.Tx, error) {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return nil, err
+	tx := r.db.WithContext(ctx).Begin()
+	if tx.Error != nil {
+		return nil, tx.Error
 	}
 
 	return &txImpl{
@@ -82,14 +92,12 @@ func (r *Repo) BeginTx(ctx context.Context) (repository.Tx, error) {
 }
 
 func (r *Repo) UpdateIdempotency(ctx context.Context, key, status, resp string, code int) error {
-	_, err := r.pool.Exec(ctx,
-		`UPDATE idempotency_records
-		 SET status=$1,
-		     status_code=$2,
-		     response_payload=$3,
-		     updated_at=NOW()
-		 WHERE idempotency_key=$4`,
-		status, code, resp, key,
-	)
-	return err
+	return r.db.WithContext(ctx).
+		Model(&model.IdempotencyRecord{}).
+		Where("idempotency_key = ?", key).
+		Updates(map[string]interface{}{
+			"status":           status,
+			"status_code":      code,
+			"response_payload": resp,
+		}).Error
 }

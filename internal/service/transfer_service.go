@@ -53,6 +53,10 @@ func (s *TransferService) Transfer(
 	// -----------------------------
 	ok, err := s.repo.ClaimIdempotency(ctx, req.IdempotencyKey, hash(req))
 	if err != nil {
+		if errors.Is(err, repository.ErrIdempotencyHashMismatch) {
+			metrics.Failure.Inc()
+			return nil, 409, fmt.Errorf("idempotency key hash mismatch")
+		}
 		metrics.Failure.Inc()
 		logger.Log.Error(err.Error(),
 			zap.String("idempotency_key", req.IdempotencyKey),
@@ -85,6 +89,7 @@ func (s *TransferService) Transfer(
 				zap.Int64("transfer_id", parsed.TransferID),
 				zap.Int("status_code", code),
 			)
+			metrics.IdempotencyHits.Inc()
 
 			return &parsed, code, nil
 		}

@@ -1,6 +1,11 @@
 package repository
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+var ErrIdempotencyHashMismatch = errors.New("idempotency hash mismatch")
 
 type Repository interface {
 	ClaimIdempotency(ctx context.Context, key, hash string) (bool, error)

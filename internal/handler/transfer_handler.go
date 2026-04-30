@@ -1,21 +1,19 @@
 package handler
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"time"
 
+	"github.com/gerry1818/wallet-transfer-assignment/internal/logger"
 	"github.com/gerry1818/wallet-transfer-assignment/internal/model"
+	"github.com/gerry1818/wallet-transfer-assignment/internal/model/dto"
 	"github.com/gerry1818/wallet-transfer-assignment/internal/service"
+	"go.uber.org/zap"
 )
 
 type Handler struct {
 	svc *service.TransferService
-}
-
-type ErrorResponse struct {
-	Error string `json:"error"`
 }
 
 func NewHandler(s *service.TransferService) *Handler {
@@ -27,22 +25,34 @@ func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", http.MethodPost)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "method not allowed",
-		})
-		return
-	}
-	var req model.TransferRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error": "invalid request body",
-		})
+		json.NewEncoder(w).Encode(dto.NewErrorResponse("method not allowed", "METHOD_NOT_ALLOWED"))
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	var reqDTO dto.TransferRequestDTO
+	if err := json.NewDecoder(r.Body).Decode(&reqDTO); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(dto.NewErrorResponse("invalid request body", "INVALID_REQUEST"))
+		return
+	}
+
+	// Create request context for structured logging
+	reqCtx := logger.NewRequestContext(reqDTO.IdempotencyKey)
+
+	// Create timeout context
+	ctx, cancel := NewContextWithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
+
+	// Convert DTO to internal model
+	req := model.TransferRequest{
+		IdempotencyKey: reqDTO.IdempotencyKey,
+		FromWalletID:   reqDTO.FromWalletID,
+		ToWalletID:     reqDTO.ToWalletID,
+		Amount:         reqDTO.Amount,
+	}
+
+	reqCtx.Info("transfer request received")
 
 	resp, code, err := h.svc.Transfer(ctx, req)
 
@@ -50,11 +60,19 @@ func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(code)
 
 	if err != nil {
-		json.NewEncoder(w).Encode(ErrorResponse{
-			Error: err.Error(),
-		})
+		reqCtx.Error("transfer failed", err)
+		json.NewEncoder(w).Encode(dto.NewErrorResponse(err.Error(), "TRANSFER_FAILED"))
 		return
 	}
 
-	json.NewEncoder(w).Encode(resp)
+	if resp != nil {
+		reqCtx = reqCtx.WithTransferID(resp.TransferID)
+		reqCtx.Info("transfer successful", zap.String("status", resp.Status))
+
+		respDTO := dto.TransferResponseDTO{
+			TransferID: resp.TransferID,
+			Status:     resp.Status,
+		}
+		json.NewEncoder(w).Encode(respDTO)
+	}
 }

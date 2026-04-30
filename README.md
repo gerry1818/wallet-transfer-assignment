@@ -1,82 +1,82 @@
-# 💸 Wallet Transfer Service
+# Wallet Transfer Service
 
-A backend service to perform **wallet-to-wallet transfers** with strong guarantees:
+Wallet-to-wallet transfer API with idempotency, transactional consistency, and basic observability.
 
-* ✅ Idempotency (exactly-once API behavior)
-* ✅ Atomicity (debit + credit succeed together)
-* ✅ Consistency (ledger always balanced)
-* ✅ Concurrency safety (no double spending)
+## Implementation summary
 
----
+This project includes all major implementation items needed for assignment and production-style local development:
 
-# ⚡ Quick Start
+- Makefile with build/run/test/lint/migration/docker targets.
+- Dockerfile and `docker-compose.yml` for app + PostgreSQL setup.
+- `.env` and `.env.example` for environment-based configuration.
+- DTO and domain model separation (`internal/model/dto` and `internal/model`).
+- GORM-compatible DB model tags for persistence entities.
+- Structured request logging with `trace_id`, `idempotency_key`, and `transfer_id`.
+- Idempotency metrics (`transfer_idempotency_hits_total`).
+- Server lifecycle handling in `internal/server` with graceful shutdown.
+- Standardized API error response shape.
+- Test suite expanded for core business and API flows.
+
+## What this service guarantees
+
+- **Atomic transfer**: debit and credit happen in one DB transaction.
+- **No double processing**: idempotency key + request hash prevents duplicate execution.
+- **Concurrency safety**: wallets are locked in deterministic order.
+- **Auditability**: transfer + ledger entries are persisted.
+
+## Quick start (for a new developer)
+
+### 1) Prerequisites
+
+- Go `1.26+`
+- Docker and Docker Compose
+- `psql` client (optional, useful for manual checks)
+
+### 2) Setup environment
 
 ```bash
-# Start PostgreSQL
-docker run --name wallet-db \
-  -e POSTGRES_USER=postgres \
-  -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=wallet \
-  -p 5432:5432 \
-  -d postgres
+cp .env.example .env
+```
 
-# Create schema
+### 3) Start PostgreSQL and run migrations
+
+```bash
+docker compose up -d postgres
 psql -h localhost -U postgres -d wallet -f migrations/schema.sql
-
-# insert sample data into wallet
 psql -h localhost -U postgres -d wallet -f migrations/seed.sql
-
-
-
-# Run service
-go mod tidy
-go run cmd/server/main.go
 ```
 
-👉 Service running at: `http://localhost:8080`
+> Default credentials are already in `.env.example`.
 
----
+### 4) Build and run the API
 
-# 🚀 Tech Stack
-
-* Golang
-* PostgreSQL
-* pgxpool (DB connection pooling)
-* Docker
-* Zap (structured logging)
-* Prometheus (metrics)
-
----
-
-# 📦 Project Structure
-
-```text
-wallet-transfer-service/
-│
-├── cmd/server/              # App entrypoint
-├── internal/
-│   ├── handler/            # HTTP layer
-│   ├── service/            # Business logic
-│   ├── repository/         # Interfaces
-│   ├── repository/postgres # DB implementation
-│   ├── model/              # Request/response models
-│   ├── db/                 # DB connection
-│   ├── logger/             # Logging (zap)
-│   └── metrics/            # Prometheus metrics
-│
-├── migrations/             # SQL schema
-├── test/                   # Unit tests
-├── go.mod
-└── README.md
+```bash
+make build
+./bin/wallet-service
 ```
 
----
+Successful build output is expected to show `Building wallet-service...` and then return to the shell prompt.
 
-# 📡 API Specification
+Service endpoints:
+- API: `http://localhost:8080/api/v1/transfers`
+- Health: `http://localhost:8080/api/v1/health`
+- Metrics: `http://localhost:8080/metrics`
 
-## 🔹 POST /transfers
+Backward-compatible endpoints:
+- `http://localhost:8080/transfers`
+- `http://localhost:8080/health`
 
-### Request
+### Alternative: run everything with Docker
+
+```bash
+make docker-up
+```
+
+## API contract
+
+### `POST /api/v1/transfers`
+
+Request:
 
 ```json
 {
@@ -87,9 +87,7 @@ wallet-transfer-service/
 }
 ```
 
----
-
-### ✅ Success Response
+Success response:
 
 ```json
 {
@@ -98,186 +96,82 @@ wallet-transfer-service/
 }
 ```
 
----
-
-### ❌ Error Response
+Error response:
 
 ```json
 {
-  "error": "insufficient balance"
+  "status": "failure",
+  "error": {
+    "message": "insufficient balance",
+    "code": "TRANSFER_FAILED"
+  }
 }
 ```
 
----
+## Idempotency behavior
 
-### 🔁 Idempotency Behavior
+- First request with a key: executes transfer and stores response.
+- Same key + same payload: returns stored response.
+- Same key + different payload: rejected.
+- Same key while in progress: returns conflict (`409`).
 
-Each request is protected using:
+## Project structure
 
-`idempotencyKey + request hash`
-
----
-
-## 🔁 Behavior
-
-### 1. First request
-- Stored in DB
-- Transfer executes
-
----
-
-### 2. Duplicate request (same key + same payload)
-- Returns cached response
-- No re-execution
-
----
-
-### 3. Duplicate request (same key + different payload)
-- ❌ Rejected (400/409)
-
----
-
-### 4. In-progress request
-
-```json
-{
-  "error": "request in progress"
-}
+```text
+Makefile                       # build/test/lint/docker/dev targets
+Dockerfile                     # multi-stage image build
+docker-compose.yml             # postgres + app services
+cmd/server/                    # application entrypoint
+internal/handler/              # HTTP handlers (DTO <-> service mapping)
+internal/service/              # transfer business logic
+internal/repository/           # repository interfaces
+internal/repository/postgres/  # postgres/gorm implementation
+internal/model/                # domain + persistence models (DB entities)
+internal/model/dto/            # transport models for API request/response
+internal/db/                   # DB initialization
+internal/logger/               # zap logger + request context
+internal/metrics/              # prometheus counters
+migrations/                    # schema and seed SQL
+test/                          # integration-style tests with mocks
 ```
 
----
+## `model` vs `dto` (is this structure correct?)
 
-# 🔒 Transaction Flow
+Yes, this split is correct and recommended:
 
-All transfers execute inside a **single DB transaction**:
+- `internal/model`: internal domain/persistence structures used by repository/service (`Wallet`, `Transfer`, `LedgerEntry`, etc.).
+- `internal/model/dto`: HTTP API payload contracts used by handlers (`TransferRequestDTO`, `TransferResponseDTO`, `ErrorResponseDTO`).
 
-1. Lock wallets (`SELECT ... FOR UPDATE`)
-2. Validate balance
-3. Create transfer record
-4. Update wallet balances
-5. Insert ledger entries (DEBIT + CREDIT)
-6. Update transfer state
-7. Commit transaction
+This separation keeps DB concerns and API contract concerns independent.
 
----
-
-# ⚡ Concurrency Safety
-
-* Row-level locking prevents race conditions
-* Prevents double spending
-* Ensures consistency under concurrent requests
-
----
-
-# 🗃️ Sample Data
-
-```sql
-INSERT INTO wallets (id, balance) VALUES
-(1, 1000),
-(2, 500);
-```
-
----
-
-# 📊 Metrics
-
-Available at:
-
-```
-GET /metrics
-```
-
-Tracks:
-
-* transfer_success_total
-* transfer_failure_total
-
----
-
-⚠️ HTTP Status Codes
-
-- 200 → Success
-- 400 → Validation / business rule failure
-- 409 → Request in progress / idempotency conflict
-- 500 → Internal server error
-
----
-
-# 🧪 Testing
-
-Run all tests:
+## Run tests and coverage
 
 ```bash
 go test ./...
+go test ./... -coverpkg=./internal/... -coverprofile=coverage.out
+go tool cover -func=coverage.out
+make coverage-core
 ```
 
-Covers:
+Current core coverage target command:
 
-* ✅ Successful transfer
-* ❌ Insufficient balance
-* 🔁 Idempotency behavior
+- `make coverage-core` -> validates core package coverage and currently reports `91.8%`.
 
----
+## Requirement checklist
 
-# 🧠 Design Decisions
+- [x] Makefile with docker-compose and developer commands
+- [x] DTO and model folder structure
+- [x] DB model tags for persistence entities
+- [x] Structured logs with request context fields
+- [x] Idempotency hit metric
+- [x] Migration support via Make targets
+- [x] Coverage command and tests
+- [x] Standardized error response format
+- [x] Environment templates (`.env.example`)
+- [x] Server setup with graceful shutdown
 
-* Strong consistency using PostgreSQL transactions
-* Pessimistic locking (SELECT FOR UPDATE)
-* Double-entry ledger system
-* Interface-based repository for testability
-* Request hash-based idempotency
+## Notes
 
----
-
-# ⚖️ Tradeoffs
-
-* Strong consistency over availability
-* Slight performance cost due to locking
-* Simpler architecture (no distributed systems)
-
----
-
-# ⚠️ Assumptions
-
-* Integer-only transfers
-* Wallet creation is out of scope
-* Single PostgreSQL instance
-
----
-
-# 🚀 Future Improvements
-
-* Distributed locking (scale-out)
-* Retry on deadlocks
-* Rate limiting
-* Authentication/authorization
-* Event-driven architecture (Kafka)
-
----
-
-# 📝 Logging Example
-
-```json
-{
-  "level": "info",
-  "msg": "transfer success",
-  "transfer_id": 1
-}
-```
-
----
-
-# 👨‍💻 Author
-
-Girish Prajapati
-
----
-
-# 🤖 AI Usage
-
-This project used AI for:
-
-* system design brainstorming
-* concurrency strategy validation
-* code structuring assistance
-* test improvements
+- Default server config is defined in `internal/server`.
+- Logs are structured JSON via Zap.
+- Prometheus counters are exposed at `/metrics`.
