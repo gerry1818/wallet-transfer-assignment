@@ -18,34 +18,47 @@ func NewRepo(p *pgxpool.Pool) *Repo {
 }
 
 func (r *Repo) ClaimIdempotency(ctx context.Context, key, hash string) (bool, error) {
-	var storedHash string
 
-	err := r.pool.QueryRow(ctx,
-		`INSERT INTO idempotency_records (idempotency_key, request_hash, status_code)
-		 VALUES ($1,$2,0)
-		 ON CONFLICT (idempotency_key)
-		 DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
-		 RETURNING request_hash`,
+	cmd, err := r.pool.Exec(ctx,
+		`INSERT INTO idempotency_records (idempotency_key, request_hash, status_code, status)
+		 VALUES ($1,$2,0,'IN_PROGRESS')
+		 ON CONFLICT (idempotency_key) DO NOTHING`,
 		key, hash,
-	).Scan(&storedHash)
+	)
 
 	if err != nil {
-		// real error
 		return false, err
 	}
 
-	// If returned hash is empty → new insert
-	if storedHash == "" {
+	// FIRST TIME INSERT → proceed
+	if cmd.RowsAffected() == 1 {
 		return true, nil
 	}
 
-	// If hash mismatch → invalid reuse
-	if storedHash != hash {
-		return false, fmt.Errorf("idempotency key reused with different request")
+	// ALREADY EXISTS → validate
+	var storedHash string
+	var status string
+
+	err = r.pool.QueryRow(ctx,
+		`SELECT request_hash, status
+		 FROM idempotency_records
+		 WHERE idempotency_key=$1`,
+		key,
+	).Scan(&storedHash, &status)
+
+	if err != nil {
+		return false, err
 	}
 
-	return false, nil // same request (duplicate)
+	// CASE 1: same request → allow reuse
+	if storedHash == hash {
+		return false, nil
+	}
+
+	// CASE 2: different request → reject
+	return false, fmt.Errorf("idempotency key reused with different request")
 }
+
 func (r *Repo) GetIdempotency(ctx context.Context, key string) (string, int, error) {
 	var resp string
 	var code int
@@ -71,10 +84,12 @@ func (r *Repo) BeginTx(ctx context.Context) (repository.Tx, error) {
 func (r *Repo) UpdateIdempotency(ctx context.Context, key, status, resp string, code int) error {
 	_, err := r.pool.Exec(ctx,
 		`UPDATE idempotency_records
-		 SET status_code=$1,
-		     response_payload=$2
-		 WHERE idempotency_key=$3`,
-		code, resp, key,
+		 SET status=$1,
+		     status_code=$2,
+		     response_payload=$3,
+		     updated_at=NOW()
+		 WHERE idempotency_key=$4`,
+		status, code, resp, key,
 	)
 	return err
 }

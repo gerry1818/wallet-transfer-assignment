@@ -23,6 +23,15 @@ func NewHandler(s *service.TransferService) *Handler {
 }
 
 func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(ErrorResponse{
+			Error: "method not allowed",
+		})
+		return
+	}
 	var req model.TransferRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)

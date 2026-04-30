@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/gerry1818/wallet-transfer-assignment/internal/logger"
 	"github.com/gerry1818/wallet-transfer-assignment/internal/metrics"
 	"github.com/gerry1818/wallet-transfer-assignment/internal/model"
 	"github.com/gerry1818/wallet-transfer-assignment/internal/repository"
+	"github.com/jackc/pgx/v5"
 
 	"go.uber.org/zap"
 )
@@ -52,22 +54,42 @@ func (s *TransferService) Transfer(
 	ok, err := s.repo.ClaimIdempotency(ctx, req.IdempotencyKey, hash(req))
 	if err != nil {
 		metrics.Failure.Inc()
+		logger.Log.Error(err.Error(),
+			zap.String("idempotency_key", req.IdempotencyKey),
+			zap.String("request_hash", hash(req)),
+			zap.String("error", err.Error()),
+		)
 		return nil, 500, err
 	}
 
-	// already processed request
 	if !ok {
 		resp, code, err := s.repo.GetIdempotency(ctx, req.IdempotencyKey)
 		if err != nil {
 			return nil, 500, err
 		}
 
+		// CASE 1: already completed → return cached response
 		if resp != "" {
 			var parsed model.TransferResponse
-			_ = json.Unmarshal([]byte(resp), &parsed)
+
+			if err := json.Unmarshal([]byte(resp), &parsed); err != nil {
+				logger.Log.Error("failed to parse cached idempotency response",
+					zap.String("idempotency_key", req.IdempotencyKey),
+					zap.Error(err),
+				)
+				return nil, 500, err
+			}
+
+			logger.Log.Info("idempotency cache hit - returning stored response",
+				zap.String("idempotency_key", req.IdempotencyKey),
+				zap.Int64("transfer_id", parsed.TransferID),
+				zap.Int("status_code", code),
+			)
+
 			return &parsed, code, nil
 		}
 
+		// CASE 2: truly in-progress OR first insert race → retry once
 		return nil, 409, fmt.Errorf("request in progress")
 	}
 
@@ -79,7 +101,14 @@ func (s *TransferService) Transfer(
 			status = "FAILED"
 
 			if respBytes == nil {
-				respBytes = []byte(fmt.Sprintf(`{"error":"%s"}`, err.Error()))
+				errorResp, marshalErr := json.Marshal(map[string]string{
+					"error": err.Error(),
+				})
+				if marshalErr != nil {
+					respBytes = []byte(`{"error":"failed to encode error response"}`)
+				} else {
+					respBytes = errorResp
+				}
 			}
 
 			if tx != nil {
@@ -135,10 +164,16 @@ func (s *TransferService) Transfer(
 	}
 	firstBal, err := tx.GetWalletForUpdate(ctx, firstWalletID)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, 404, fmt.Errorf("wallet %d not found", firstWalletID)
+		}
 		return nil, 500, err
 	}
 	secondBal, err := tx.GetWalletForUpdate(ctx, secondWalletID)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, 404, fmt.Errorf("wallet %d not found", secondWalletID)
+		}
 		return nil, 500, err
 	}
 	var fromBal, toBal int64
@@ -157,6 +192,15 @@ func (s *TransferService) Transfer(
 		metrics.Failure.Inc()
 		err = fmt.Errorf("insufficient balance")
 		httpCode = 400
+
+		logger.Log.Error("transfer rejected due to insufficient balance",
+			zap.String("idempotency_key", req.IdempotencyKey),
+			zap.Int64("from_wallet_id", req.FromWalletID),
+			zap.Int64("to_wallet_id", req.ToWalletID),
+			zap.Int64("requested_amount", req.Amount),
+			zap.Int64("available_balance", fromBal),
+		)
+
 		return nil, httpCode, err
 	}
 
